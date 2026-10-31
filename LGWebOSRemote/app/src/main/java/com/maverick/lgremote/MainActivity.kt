@@ -14,6 +14,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.MotionEvent
 import android.view.View
+import android.util.Log
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -32,25 +33,16 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
-import java.security.cert.X509Certificate
 
 class MainActivity : Activity() {
+    companion object { private const val TAG = "MyTVRemote" }
     private val prefs by lazy { getSharedPreferences("lg_remote", MODE_PRIVATE) }
-    private val trustManagers = arrayOf<TrustManager>(object : X509TrustManager {
-        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-    })
+    // Use OkHttp's platform TLS defaults. Never install a trust-all certificate manager.
     private val client: OkHttpClient by lazy {
-        val ssl = SSLContext.getInstance("TLS")
-        ssl.init(null, trustManagers, java.security.SecureRandom())
         OkHttpClient.Builder()
-            .sslSocketFactory(ssl.socketFactory, trustManagers[0] as X509TrustManager)
-            .hostnameVerifier { _, _ -> true }
+            .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
             .pingInterval(25, TimeUnit.SECONDS)
             .build()
     }
@@ -187,6 +179,7 @@ class MainActivity : Activity() {
 
     private fun discoverTvs() {
         if (!discoveryRunning.compareAndSet(false, true)) return
+        Log.i(TAG, "Starting SSDP discovery")
         if (page == 0) homeStatus("Searching for TVs…", false)
         Thread {
             val found = ArrayList<Pair<String, String>>()
@@ -222,14 +215,18 @@ class MainActivity : Activity() {
                                 if (found.any { it.first == ip }) continue
                                 val name = readDeviceName(location) ?: "LG webOS TV"
                                 if (name.contains("LG", true) || name.contains("webOS", true) ||
-                                    name.contains("UHD", true)) found.add(ip to name)
+                                    name.contains("UHD", true)) {
+                                    Log.i(TAG, "Discovered possible TV at $ip ($name)")
+                                    found.add(ip to name)
+                                }
                             }
                         } catch (_: SocketTimeoutException) {}
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.e(TAG, "SSDP discovery failed", e)
             } finally {
-                try { if (lock?.isHeld == true) lock?.release() } catch (_: Exception) {}
+                try { if (lock?.isHeld == true) lock?.release() } catch (e: Exception) { Log.w(TAG, "Could not release multicast lock", e) }
                 discoveryRunning.set(false)
             }
             runOnUiThread {
@@ -297,6 +294,7 @@ class MainActivity : Activity() {
             Request.Builder().url("ws://$tvIp:3000").build(),
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    Log.i(TAG, "WebSocket opened to TV at $tvIp; sending registration")
                     val savedKey = prefs.getString("key_$tvIp", null)
                     val payload = JSONObject().put("forcePairing", false)
                     if (!savedKey.isNullOrBlank()) payload.put("client-key", savedKey)
@@ -347,9 +345,11 @@ class MainActivity : Activity() {
                         val type = msg.optString("type")
                         val id = msg.optString("id")
                         val payload = msg.optJSONObject("payload") ?: JSONObject()
+                        Log.d(TAG, "TV message received: type=$type id=$id")
                         if (type == "registered" || (id == "register_0" && type == "response")) {
                             val key = payload.optString("client-key")
                             if (key.isNotBlank()) prefs.edit().putString("key_$tvIp", key).apply()
+                            Log.i(TAG, "TV registration accepted; client key ${if (key.isNotBlank()) "saved" else "not returned"}")
                             runOnUiThread { showRemote() }
                             requestPointerSocket()
                         } else if (id == "pointer_socket") {
@@ -359,28 +359,34 @@ class MainActivity : Activity() {
                                 pointerSocket = client.newWebSocket(Request.Builder().url(wsUrl).build(),
                                     object : WebSocketListener() {
                                         override fun onOpen(webSocket: WebSocket, response: Response) {
+                                            Log.i(TAG, "Pointer input WebSocket connected")
                                             runOnUiThread { remoteStatus("Connected to $tvName") }
                                         }
                                         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                                            Log.e(TAG, "Pointer input WebSocket failed", t)
                                             runOnUiThread { remoteStatus("Pointer connection unavailable") }
                                         }
                                     })
                             }
                         } else if (type == "error") {
+                            Log.e(TAG, "TV returned protocol error: ${payload.optString("error", text)}")
                             runOnUiThread { showHome("TV rejected connection · Try pairing again") }
                         }
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) { Log.e(TAG, "Could not parse TV WebSocket message", e) }
                 }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    Log.e(TAG, "TV WebSocket connection failed (HTTP ${response?.code ?: "no response"})", t)
                     runOnUiThread { disconnect(); showHome("Offline · Check Wi-Fi and TV") }
                 }
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    Log.w(TAG, "TV WebSocket closed: code=$code reason=$reason")
                     runOnUiThread { if (page == 1) showHome("TV disconnected") }
                 }
             })
     }
 
     private fun requestPointerSocket() {
+        Log.d(TAG, "Requesting TV pointer input socket")
         mainSocket?.send(JSONObject().put("id", "pointer_socket").put("type", "request")
             .put("uri", "ssap://com.webos.service.networkinput/getPointerInputSocket")
             .put("payload", JSONObject()).toString())
@@ -389,13 +395,15 @@ class MainActivity : Activity() {
     private fun sendButton(name: String) {
         val socket = pointerSocket
         if (socket == null) { remoteStatus("Control connection not ready"); return }
-        socket.send("type:button\nname:$name\n\n")
+        val sent = socket.send("type:button\nname:$name\n\n")
+        Log.d(TAG, "Pointer button $name queued=$sent")
     }
 
     private fun sendRequest(uri: String, payload: JSONObject = JSONObject()) {
         if (mainSocket == null) { remoteStatus("Connect to your TV first"); return }
-        mainSocket?.send(JSONObject().put("id", "cmd_${System.nanoTime()}")
-            .put("type", "request").put("uri", uri).put("payload", payload).toString())
+        val sent = mainSocket?.send(JSONObject().put("id", "cmd_${System.nanoTime()}")
+            .put("type", "request").put("uri", uri).put("payload", payload).toString()) ?: false
+        Log.d(TAG, "TV command queued=$sent uri=$uri")
     }
 
     private fun launchApp(id: String) {
@@ -697,6 +705,7 @@ class MainActivity : Activity() {
     }
 
     private fun disconnect() {
+        Log.d(TAG, "Closing TV sockets")
         pointerSocket?.close(1000, "App inactive"); pointerSocket = null
         mainSocket?.close(1000, "App inactive"); mainSocket = null
     }
