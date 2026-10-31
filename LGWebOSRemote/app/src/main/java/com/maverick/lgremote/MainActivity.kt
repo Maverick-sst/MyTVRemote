@@ -300,19 +300,46 @@ class MainActivity : Activity() {
                     val savedKey = prefs.getString("key_$tvIp", null)
                     val payload = JSONObject().put("forcePairing", false)
                     if (!savedKey.isNullOrBlank()) payload.put("client-key", savedKey)
-                    payload.put("manifest", JSONObject()
-                        .put("manifestVersion", 1).put("appVersion", "1.0")
-                        .put("permissions", JSONArray(listOf(
-                            "LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CONTROL_AUDIO",
-                            "CONTROL_POWER", "READ_INSTALLED_APPS", "READ_RUNNING_APPS",
-                            "READ_TV_CHANNEL_LIST", "CONTROL_MOUSE_AND_KEYBOARD",
-                            "READ_NETWORK_STATE"
-                        )))
-                        .put("signatures", JSONArray().put(JSONObject()
-                            .put("signatureVersion", 1)
-                            .put("signature", "Maverick-LG-Remote")))
-                    webSocket.send(JSONObject().put("type", "register")
-                        .put("id", "register_0").put("payload", payload).toString())
+
+                    payload.put(
+                        "manifest",
+                        JSONObject()
+                            .put("manifestVersion", 1)
+                            .put("appVersion", "1.0")
+                            .put(
+                                "permissions",
+                                JSONArray(
+                                    listOf(
+                                        "LAUNCH",
+                                        "LAUNCH_WEBAPP",
+                                        "APP_TO_APP",
+                                        "CONTROL_AUDIO",
+                                        "CONTROL_POWER",
+                                        "READ_INSTALLED_APPS",
+                                        "READ_RUNNING_APPS",
+                                        "READ_TV_CHANNEL_LIST",
+                                        "CONTROL_MOUSE_AND_KEYBOARD",
+                                        "READ_NETWORK_STATE"
+                                    )
+                                )
+                            )
+                            .put(
+                                "signatures",
+                                JSONArray().put(
+                                    JSONObject()
+                                        .put("signatureVersion", 1)
+                                        .put("signature", "Maverick-LG-Remote")
+                                )
+                            )
+                    )
+
+                    webSocket.send(
+                        JSONObject()
+                            .put("type", "register")
+                            .put("id", "register_0")
+                            .put("payload", payload)
+                            .toString()
+                    )
                 }
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     try {
