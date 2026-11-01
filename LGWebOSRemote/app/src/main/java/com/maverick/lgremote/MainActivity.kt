@@ -287,6 +287,10 @@ class MainActivity : Activity() {
         )
         content.addView(
             button("Settings", panel, white, 18f, 15f) { showSettings() },
+            lp(h = dp(50f), bottom = 10)
+        )
+        content.addView(
+            button("Troubleshoot connection", panel, white, 18f, 15f) { runDiagnostics() },
             lp(h = dp(50f))
         )
 
@@ -339,7 +343,7 @@ class MainActivity : Activity() {
         if (!discovering.compareAndSet(false, true)) return
         if (page == PAGE_HOME) homeStatus("Searching for TVs…", false)
         Thread {
-            val found = ArrayList<Pair<String, String>>()
+            val found = ArrayList<Found>()
             var lock: android.net.wifi.WifiManager.MulticastLock? = null
             try {
                 val wifi = applicationContext
@@ -381,9 +385,15 @@ class MainActivity : Activity() {
                                 ?.substringAfter(":")?.trim()
                             if (location.isNullOrBlank()) continue
                             val ip = packet.address.hostAddress ?: continue
-                            if (found.any { it.first == ip }) continue
-                            val name = readDeviceName(location) ?: continue
-                            found.add(ip to name)
+                            if (found.any { it.ip == ip }) continue
+                            val info = readDeviceInfo(location)
+                            found.add(
+                                Found(
+                                    ip,
+                                    info?.first ?: "Device at $ip",
+                                    info?.second ?: false
+                                )
+                            )
                         } catch (_: SocketTimeoutException) {
                         }
                     }
@@ -396,11 +406,19 @@ class MainActivity : Activity() {
                 }
                 discovering.set(false)
             }
-            runOnUiThread { showDiscoveredTvs(found) }
+            runOnUiThread {
+                showDiscoveredTvs(
+                    found.sortedWith(
+                        compareByDescending<Found> { it.isLg }.thenBy { it.name.lowercase() }
+                    )
+                )
+            }
         }.start()
     }
 
-    private fun showDiscoveredTvs(found: List<Pair<String, String>>) {
+    private data class Found(val ip: String, val name: String, val isLg: Boolean)
+
+    private fun showDiscoveredTvs(found: List<Found>) {
         if (found.isEmpty()) {
             if (page == PAGE_HOME) homeStatus("No TV found · Check Wi-Fi", false)
             AlertDialog.Builder(this)
@@ -415,11 +433,15 @@ class MainActivity : Activity() {
                 .show()
             return
         }
-        if (page == PAGE_HOME) homeStatus("Found ${found.size} TV(s)", true)
+        if (page == PAGE_HOME) homeStatus("Found ${found.size} device(s)", true)
         AlertDialog.Builder(this)
-            .setTitle("Choose your LG TV")
-            .setItems(found.map { "${it.second}\n${it.first}" }.toTypedArray()) { _, index ->
-                saveTv(found[index].first, found[index].second)
+            .setTitle("Choose your TV")
+            .setItems(
+                found.map {
+                    (if (it.isLg) "LG · " else "") + it.name + "\n" + it.ip
+                }.toTypedArray()
+            ) { _, index ->
+                saveTv(found[index].ip, found[index].name)
                 showHome("TV saved · Connecting…")
                 connect()
             }
@@ -428,7 +450,7 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun readDeviceName(location: String): String? = try {
+    private fun readDeviceInfo(location: String): Pair<String, Boolean>? = try {
         val connection = URL(location).openConnection() as HttpURLConnection
         connection.connectTimeout = 1400
         connection.readTimeout = 1400
@@ -441,12 +463,13 @@ class MainActivity : Activity() {
             doc.getElementsByTagName(name).item(0)?.textContent?.trim() ?: ""
         val manufacturer = tag("manufacturer")
         val model = tag("modelName")
-        val friendly = tag("friendlyName").ifBlank { "LG webOS TV" }
+        val friendly = tag("friendlyName")
         val isLg = manufacturer.contains("LG", true) ||
             model.contains("LG", true) ||
             model.contains("webOS", true) ||
             friendly.contains("LG", true)
-        if (isLg) friendly.ifBlank { model.ifBlank { "LG webOS TV" } } else null
+        val name = friendly.ifBlank { model }.ifBlank { "Device" }
+        name to isLg
     } catch (_: Exception) {
         null
     }
@@ -506,7 +529,7 @@ class MainActivity : Activity() {
                 )
                 val manifest = JSONObject()
                     .put("manifestVersion", 1)
-                    .put("appVersion", "1.1")
+                    .put("appVersion", "1.2")
                     .put("permissions", permissions)
                     .put(
                         "signatures",
@@ -518,6 +541,7 @@ class MainActivity : Activity() {
                     )
                 val payload = JSONObject()
                     .put("forcePairing", false)
+                    .put("pairingType", "PROMPT")
                     .put("manifest", manifest)
                 if (!savedKey.isNullOrBlank()) payload.put("client-key", savedKey)
                 webSocket.send(
@@ -537,9 +561,10 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     if (webSocket !== mainSocket || isFinishing || isDestroyed) return@runOnUiThread
                     disconnect()
+                    val detail = t.message?.take(90) ?: "connection failed"
                     showHome(
-                        if (page == PAGE_REMOTE) "TV disconnected · Check Wi-Fi"
-                        else "Could not reach TV · Check Wi-Fi"
+                        if (page == PAGE_REMOTE) "TV disconnected · $detail"
+                        else "Could not reach TV · $detail"
                     )
                 }
             }
@@ -921,6 +946,7 @@ class MainActivity : Activity() {
             "Enter IP manually",
             "Set MAC for Wake-on-LAN",
             "Find another TV",
+            "Test connection",
             "Forget TV"
         )
         AlertDialog.Builder(this)
@@ -931,7 +957,8 @@ class MainActivity : Activity() {
                     1 -> promptManualIp()
                     2 -> promptMac()
                     3 -> discoverTvs()
-                    4 -> forgetTv()
+                    4 -> runDiagnostics()
+                    5 -> forgetTv()
                 }
             }
             .setNegativeButton("Close", null)
@@ -1019,25 +1046,166 @@ class MainActivity : Activity() {
                     mac.substring(i * 2, i * 2 + 2).toInt(16).toByte()
                 }
                 val packet = ByteArray(6) { 0xFF.toByte() } + ByteArray(16) { macBytes[it % 6] }
+                val local = localIpv4()
+                val directed = if (local.count { it == '.' } == 3) {
+                    local.substringBeforeLast('.') + ".255"
+                } else {
+                    null
+                }
+                val targets = listOfNotNull("255.255.255.255", directed).distinct()
                 DatagramSocket().use { socket ->
                     socket.broadcast = true
-                    repeat(3) {
-                        socket.send(
-                            DatagramPacket(
-                                packet,
-                                packet.size,
-                                InetAddress.getByName("255.255.255.255"),
-                                9
-                            )
-                        )
-                        Thread.sleep(120)
+                    repeat(5) {
+                        for (target in targets) {
+                            for (port in intArrayOf(9, 7)) {
+                                try {
+                                    socket.send(
+                                        DatagramPacket(
+                                            packet,
+                                            packet.size,
+                                            InetAddress.getByName(target),
+                                            port
+                                        )
+                                    )
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
+                        Thread.sleep(150)
                     }
                 }
-                runOnUiThread { remoteStatus("Wake packet sent · TV must support network wake") }
+                runOnUiThread {
+                    remoteStatus("Wake sent to ${targets.joinToString()} · TV must allow network wake")
+                }
             } catch (e: Exception) {
                 runOnUiThread { remoteStatus("Wake failed: ${e.message}") }
             }
         }.start()
+    }
+
+    // ----------------------------------------------------------- diagnostics
+
+    private fun runDiagnostics() {
+        if (tvIp.isBlank()) {
+            AlertDialog.Builder(this)
+                .setTitle("Connection test")
+                .setMessage("No TV address saved yet. Find your TV or enter its IP first.")
+                .setPositiveButton("Enter IP") { _, _ -> promptManualIp() }
+                .setNegativeButton("Close", null)
+                .show()
+            return
+        }
+        val ip = tvIp
+        val progress = AlertDialog.Builder(this)
+            .setTitle("Connection test")
+            .setMessage("Testing $ip…")
+            .setNegativeButton("Close", null)
+            .show()
+        Thread {
+            val report = StringBuilder()
+            report.append("Phone: ").append(localIpv4()).append('\n')
+            report.append("TV:    ").append(ip).append("\n\n")
+            for (port in intArrayOf(3000, 3001, 1900)) {
+                val start = System.currentTimeMillis()
+                val result = try {
+                    Socket().use { it.connect(InetSocketAddress(ip, port), 2500) }
+                    "open"
+                } catch (e: Exception) {
+                    "failed (${(e.message ?: e.javaClass.simpleName).take(70)})"
+                }
+                report.append("TCP ").append(port).append(": ").append(result)
+                    .append(" [").append(System.currentTimeMillis() - start).append(" ms]\n")
+            }
+            report.append('\n')
+            val http = try {
+                val connection = URL("http://$ip:3000/").openConnection() as HttpURLConnection
+                connection.connectTimeout = 2500
+                connection.readTimeout = 2500
+                "HTTP ${connection.responseCode}"
+            } catch (e: Exception) {
+                "failed (${(e.message ?: e.javaClass.simpleName).take(70)})"
+            }
+            report.append("TV web server: ").append(http).append("\n\n")
+            report.append("SSDP replies (4s):\n")
+            val devices = quickDiscovery()
+            if (devices.isEmpty()) {
+                report.append("none · router is blocking multicast\n")
+            } else {
+                devices.forEach { report.append("• ").append(it).append('\n') }
+            }
+            report.append("\nIf TCP 3000 fails, turn on \"Mobile TV On\" / \"LG Connect Apps\" ")
+                .append("in the TV network settings and make sure both devices share the same Wi-Fi.")
+            runOnUiThread {
+                progress.dismiss()
+                AlertDialog.Builder(this)
+                    .setTitle("Connection test")
+                    .setMessage(report.toString())
+                    .setPositiveButton("Copy") { _, _ ->
+                        val clipboard =
+                            getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(
+                            android.content.ClipData.newPlainText("Connection test", report.toString())
+                        )
+                    }
+                    .setNegativeButton("Close", null)
+                    .show()
+            }
+        }.start()
+    }
+
+    private fun quickDiscovery(): List<String> {
+        val found = LinkedHashSet<String>()
+        var lock: android.net.wifi.WifiManager.MulticastLock? = null
+        try {
+            val wifi = applicationContext
+                .getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+            lock = wifi.createMulticastLock("my-tv-diagnostics").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            DatagramSocket(null).use { socket ->
+                socket.soTimeout = 500
+                socket.bind(InetSocketAddress(0))
+                val message = "M-SEARCH * HTTP/1.1\r\n" +
+                    "HOST: 239.255.255.250:1900\r\n" +
+                    "MAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n"
+                val bytes = message.toByteArray()
+                socket.send(
+                    DatagramPacket(
+                        bytes,
+                        bytes.size,
+                        InetAddress.getByName("239.255.255.250"),
+                        1900
+                    )
+                )
+                val deadline = System.currentTimeMillis() + 4000
+                val buffer = ByteArray(4096)
+                while (System.currentTimeMillis() < deadline) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        socket.receive(packet)
+                        packet.address.hostAddress?.let { found.add(it) }
+                    } catch (_: SocketTimeoutException) {
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            try {
+                if (lock?.isHeld == true) lock?.release()
+            } catch (_: Exception) {
+            }
+        }
+        return found.toList()
+    }
+
+    private fun localIpv4(): String = try {
+        java.net.NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .firstOrNull { !it.isLoopbackAddress && it is java.net.Inet4Address }
+            ?.hostAddress ?: "unknown"
+    } catch (_: Exception) {
+        "unknown"
     }
 
     // ------------------------------------------------------------- custom views
