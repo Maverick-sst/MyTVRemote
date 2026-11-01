@@ -1,4 +1,4 @@
-name: Build LG webOS Remote APK
+name: Build My TV Remote APK
 
 on:
   pull_request:
@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: android-apk-build
+  group: android-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Compile Android APK
+    name: Build APK
     runs-on: ubuntu-latest
 
     steps:
@@ -47,17 +47,67 @@ jobs:
           test -f LGWebOSRemote/build.gradle
           test -f LGWebOSRemote/app/build.gradle
           test -f LGWebOSRemote/app/src/main/AndroidManifest.xml
+          test -x LGWebOSRemote/gradlew
 
-      - name: Build debug APK
-        working-directory: LGWebOSRemote
+      - name: Restore release keystore
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          gradle --version
-          gradle --no-daemon --stacktrace assembleDebug
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is not configured"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
-      - name: Upload APK
+      - name: Build APK
+        working-directory: LGWebOSRemote
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Prepare download file
+        run: |
+          cp LGWebOSRemote/app/build/outputs/apk/release/app-release.apk MyTVRemote.apk
+          ls -lh MyTVRemote.apk
+          sha256sum MyTVRemote.apk
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyTVRemote-debug-apk
-          path: LGWebOSRemote/app/build/outputs/apk/debug/app-debug.apk
+          name: MyTVRemote-apk
+          path: MyTVRemote.apk
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish latest APK
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: MyTVRemote-apk
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest \
+              --title "My TV Remote (latest)" \
+              --notes "Always-current signed APK. Download \`MyTVRemote.apk\` and install it on your phone. Android may ask you to allow installs from your browser." \
+              --latest
+          fi
+          gh release upload latest MyTVRemote.apk --clobber
+          gh release edit latest --latest
