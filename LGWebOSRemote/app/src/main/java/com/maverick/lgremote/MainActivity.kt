@@ -474,8 +474,18 @@ class MainActivity : Activity() {
         null
     }
 
+    private fun normalizeIp(raw: String): String {
+        var value = raw.trim()
+        for (prefix in listOf("http://", "https://", "ws://", "wss://")) {
+            if (value.startsWith(prefix, true)) value = value.substring(prefix.length)
+        }
+        value = value.substringBefore('/').trim()
+        if (value.count { it == ':' } == 1) value = value.substringBefore(':').trim()
+        return value
+    }
+
     private fun saveTv(ip: String, name: String) {
-        tvIp = ip
+        tvIp = normalizeIp(ip)
         tvName = name.ifBlank { "LG webOS TV" }
         prefs.edit().putString("ip", tvIp).putString("tv_name", tvName).apply()
     }
@@ -495,7 +505,7 @@ class MainActivity : Activity() {
             .setMessage("Find the TV IP in TV Settings → Network → Wi-Fi Connection.")
             .setView(input)
             .setPositiveButton("Connect") { _, _ ->
-                val ip = input.text.toString().trim()
+                val ip = normalizeIp(input.text.toString())
                 if (ip.isNotEmpty()) {
                     saveTv(ip, if (tvName.isBlank()) "LG webOS TV" else tvName)
                     showHome("Connecting…")
@@ -1126,6 +1136,7 @@ class MainActivity : Activity() {
                 "failed (${(e.message ?: e.javaClass.simpleName).take(70)})"
             }
             report.append("TV web server: ").append(http).append("\n\n")
+            report.append("WebSocket: ").append(webSocketProbe(ip)).append("\n\n")
             report.append("SSDP replies (4s):\n")
             val devices = quickDiscovery()
             if (devices.isEmpty()) {
@@ -1151,6 +1162,33 @@ class MainActivity : Activity() {
                     .show()
             }
         }.start()
+    }
+
+    private fun webSocketProbe(ip: String): String {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result = "no response in 6s"
+        val probe = client.newWebSocket(
+            Request.Builder().url("ws://$ip:$TV_PORT").build(),
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    result = "opened (HTTP ${response.code})"
+                    latch.countDown()
+                    webSocket.close(1000, null)
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    result = "failed: " + (t.message ?: t.javaClass.simpleName)
+                    latch.countDown()
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    latch.countDown()
+                }
+            }
+        )
+        latch.await(6, TimeUnit.SECONDS)
+        probe.cancel()
+        return result
     }
 
     private fun quickDiscovery(): List<String> {
