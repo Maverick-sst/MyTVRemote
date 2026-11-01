@@ -4,3 +4,15 @@ local.properties
 /build/
 app/build/
 *.iml
+
+# Signing material must never be committed
+*.jks
+*.keystore
+*.p12
+keystore.properties
+
+# Local build noise
+*.log
+*.bak
+*.bak-*
+.DS_Store

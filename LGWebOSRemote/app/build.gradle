@@ -3,6 +3,15 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Release signing is optional. When the CI secrets are present the workflow
+// materialises a keystore and exports these variables, so every build is signed
+// with the same key and can be installed as an update. Without them we fall back
+// to the debug key so pull-request builds still produce an installable APK.
+def keystorePath = System.getenv("KEYSTORE_FILE")
+def hasReleaseSigning = keystorePath != null &&
+        !keystorePath.trim().isEmpty() &&
+        file(keystorePath).exists()
+
 android {
     namespace 'com.maverick.lgremote'
     compileSdk 35
@@ -11,8 +20,29 @@ android {
         applicationId 'com.maverick.lgremote'
         minSdk 23
         targetSdk 28
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '1.1'
+        resourceConfigurations += ['en']
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(keystorePath)
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
+        }
     }
 
     compileOptions {
@@ -22,6 +52,16 @@ android {
 
     kotlinOptions {
         jvmTarget = '17'
+    }
+
+    buildFeatures {
+        buildConfig false
+    }
+
+    // This app is sideloaded, not published on Google Play, so an older
+    // targetSdk is intentional and the Play-only warning is not actionable.
+    lint {
+        disable 'ExpiredTargetSdkVersion'
     }
 }
 
